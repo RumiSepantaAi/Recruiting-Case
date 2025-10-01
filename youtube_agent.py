@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import argparse, os, re, pathlib, json, math, textwrap
-from typing import List, Dict, Tuple
+import argparse, os, re, pathlib, json, math, sys
+from typing import List
 from dataclasses import dataclass
 
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, VideoUnavailable
+from getpass import getpass
+from dotenv import load_dotenv
 
 # --- OpenAI (optionaler Einsatz) ---
 from openai import OpenAI
@@ -15,16 +17,12 @@ from openai import OpenAI
 YOUTUBE_OEMBED = "https://www.youtube.com/oembed"
 
 def get_video_id(url: str) -> str:
-    # direkte ID?
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", url or ""):
         return url
-    # youtu.be/<id>
     m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})", url)
     if m: return m.group(1)
-    # watch?v=<id>
     m = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", url)
     if m: return m.group(1)
-    # shorts/<id>
     m = re.search(r"shorts/([A-Za-z0-9_-]{11})", url)
     if m: return m.group(1)
     raise ValueError("Konnte keine YouTube-Video-ID extrahieren.")
@@ -57,7 +55,6 @@ class Segment:
 
 def fetch_transcript(video_id: str, lang_priority: List[str]) -> List[Segment]:
     try_order = lang_priority + list({"de","en"} - set(lang_priority))
-    # Direkter Call mit Sprachen
     for langs in [try_order, lang_priority, ["de"], ["en"]]:
         try:
             raw = YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
@@ -66,10 +63,8 @@ def fetch_transcript(video_id: str, lang_priority: List[str]) -> List[Segment]:
             continue
         except Exception:
             continue
-    # Fallback Listing (manuell/auto/translate)
     try:
         listing = YouTubeTranscriptApi.list_transcripts(video_id)
-        # manuell bevorzugen
         for code in try_order:
             try:
                 tr = listing.find_transcript([code])
@@ -77,7 +72,6 @@ def fetch_transcript(video_id: str, lang_priority: List[str]) -> List[Segment]:
                 return [Segment(start=i["start"], text=i["text"].strip()) for i in raw if i.get("text")]
             except Exception:
                 pass
-        # übersetzt
         for code in try_order:
             try:
                 tr = listing.find_transcript([code]).translate(code)
@@ -90,7 +84,6 @@ def fetch_transcript(video_id: str, lang_priority: List[str]) -> List[Segment]:
     return []
 
 def format_transcript_for_llm(segments: List[Segment]) -> str:
-    # Jede Zeile: [MM:SS] Text  — so kann das LLM Zitate mit Timestamp extrahieren
     lines = []
     for seg in segments:
         t = seg.text.replace("\n", " ").strip()
@@ -98,22 +91,55 @@ def format_transcript_for_llm(segments: List[Segment]) -> str:
             lines.append(f"[{mmss(seg.start)}] {t}")
     return "\n".join(lines)
 
-# ---------- LLM Aufrufe ----------
-def openai_client_or_none():
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        return None
+# ---------- LLM / Config ----------
+def load_config_env():
+    # .env laden (falls vorhanden)
+    load_dotenv(override=False)
+    return os.getenv("OPENAI_API_KEY"), os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+def resolve_api_key(cli_key: str | None, ask_key: bool) -> str | None:
+    # Priorität: CLI > ENV/.env > interaktiv (wenn erlaubt & TTY)
+    env_key, _ = load_config_env()
+    key = cli_key or env_key
+    if key:
+        return key
+    if ask_key and sys.stdin.isatty():
+        entered = getpass("Bitte gib deinen OpenAI API Key ein (wird NICHT angezeigt): ").strip()
+        return entered or None
+    return None
+
+def maybe_save_key_to_env(key: str, save: bool):
+    if not (save and key):
+        return
+    env_path = pathlib.Path(".env")
+    lines = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+        # vorhandenen Eintrag ersetzen
+        found = False
+        for i, line in enumerate(lines):
+            if line.startswith("OPENAI_API_KEY="):
+                lines[i] = f"OPENAI_API_KEY={key}"
+                found = True
+                break
+        if not found:
+            lines.append(f"OPENAI_API_KEY={key}")
+    else:
+        lines = [f"OPENAI_API_KEY={key}"]
+    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print("[OK] API-Key lokal in .env gespeichert (nicht committen!).")
+
+def openai_client_or_error(key: str):
     try:
         return OpenAI(api_key=key)
-    except Exception:
-        return None
+    except Exception as e:
+        print(f"[FEHLER] Konnte OpenAI-Client nicht initialisieren: {e}")
+        sys.exit(1)
 
+# ---------- LLM Prompts ----------
 def llm_single_pass_markdown(client, model: str, title: str, url: str, transcript_block: str,
                              language_hint: str, max_tldr: int, max_keypoints: int,
                              include: List[str]) -> str:
-    """
-    Ein einziger Prompt, das LLM soll direkt die fertige Markdown-Notiz ausgeben.
-    """
     include_set = set(include or [])
     wants_quotes = "quotes" in include_set
     wants_questions = "questions" in include_set
@@ -152,7 +178,6 @@ Hier ist das Transcript (Zeile je Segment):
 
 
 """
-
     resp = client.chat.completions.create(
         model=model,
         temperature=0.2,
@@ -164,11 +189,9 @@ Hier ist das Transcript (Zeile je Segment):
     return resp.choices[0].message.content.strip()
 
 def chunk(text: str, max_chars: int = 12000) -> List[str]:
-    # Grobe, robuste Char-basierte Chunking-Strategie mit Zeilen-Schnitt
     if len(text) <= max_chars:
         return [text]
-    parts, buf = [], []
-    size = 0
+    parts, buf, size = [], [], 0
     for line in text.splitlines(True):
         if size + len(line) > max_chars and buf:
             parts.append("".join(buf))
@@ -180,10 +203,6 @@ def chunk(text: str, max_chars: int = 12000) -> List[str]:
 
 def llm_map_reduce(client, model: str, title: str, url: str, transcript_block: str,
                    language_hint: str, max_tldr: int, max_keypoints: int, include: List[str]) -> str:
-    """
-    2-stufig: 1) Chunk-Zusammenfassungen, 2) Finaler Merge → Markdown.
-    """
-    # 1) Map: Chunk-Zusammenfassungen
     summaries = []
     for i, part in enumerate(chunk(transcript_block), 1):
         sys = f"Fasse folgendes Transkript-Teil in {language_hint.upper()} extrem prägnant zusammen. Gib 5–8 Bulletpoints aus. Keine Halluzinationen."
@@ -195,7 +214,6 @@ def llm_map_reduce(client, model: str, title: str, url: str, transcript_block: s
         )
         summaries.append(r.choices[0].message.content.strip())
 
-    # 2) Reduce: Finales Markdown bauen
     merged = "\n".join(f"- {s}" for s in summaries)
     sys_final = f"Baue aus Stichpunkten eine klare Markdown-Notiz in {language_hint.upper()} nach Vorgabe. Strikt, prägnant, keine Halluzination."
     user_final = f"""
@@ -226,6 +244,11 @@ def main():
     ap.add_argument("--include", nargs="*", default=["quotes","questions","glossary"],
                     help="Optionale Sektionen: quotes questions glossary")
     ap.add_argument("--max-prompt-chars", type=int, default=12000, help="Fallback-Chunking, wenn Transcript größer ist")
+    # NEU: Key/Modell-Handling
+    ap.add_argument("--api-key", type=str, default=None, help="OpenAI API Key (überschreibt ENV)")
+    ap.add_argument("--ask-key", action="store_true", help="API-Key interaktiv abfragen, falls nicht vorhanden")
+    ap.add_argument("--save-key", action="store_true", help="Eingegebenen Key in .env speichern (nicht committen!)")
+    ap.add_argument("--model", type=str, default=None, help="OpenAI Modell (überschreibt ENV/Default)")
     args = ap.parse_args()
 
     url = args.url
@@ -262,32 +285,25 @@ def main():
         outfile.write_text(md, encoding="utf-8"); print(f"[OK] Geschrieben: {outfile}"); return
 
     transcript_block = format_transcript_for_llm(segments)
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    client = openai_client_or_none()
 
-    if not client:
-        # Kein LLM? Minimaler Fallback: Roh-Transcript in einfache Notiz.
-        print("[HINWEIS] Kein OPENAI_API_KEY gesetzt. Schreibe einfache, nicht-verdichtete Notiz.")
-        raw_md = f"""# {title}
-- Quelle: {url}
+    # --- API-Key & Modell auflösen ---
+    api_key = resolve_api_key(args.api_key, ask_key=args.ask_key)
+    if not api_key:
+        print(
+            "[FEHLER] Kein OpenAI API Key gefunden.\n"
+            "Setze entweder die Umgebungsvariable OPENAI_API_KEY, lege eine .env an, "
+            "nutze --api-key oder starte mit --ask-key für eine Eingabeaufforderung."
+        )
+        sys.exit(1)
 
-## TL;DR (3–5 Bullet Points)
-- (Kein LLM aktiv) Bitte OPENAI_API_KEY setzen für automatische Verdichtung.
+    if args.save_key:
+        maybe_save_key_to_env(api_key, save=True)
 
-## Kernaussagen
-- Transcript-Export unten.
+    # Modell: CLI > ENV > Default
+    _, env_model = load_config_env()
+    model = args.model or env_model or "gpt-4o-mini"
 
-## Struktur / Outline
-1. (Nicht generiert ohne LLM)
-
-## Zitate mit Zeitstempel
-(Nur mit LLM.)
-
-## Transcript (Roh)
-
-
-"""
-        outfile.write_text(raw_md, encoding="utf-8"); print(f"[OK] Geschrieben: {outfile}"); return
+    client = openai_client_or_error(api_key)
 
     # Ein-Pass wenn kurz genug, sonst Map-Reduce
     if len(transcript_block) <= args.max_prompt_chars:
@@ -304,14 +320,14 @@ def main():
             max_keypoints=args.max_keypoints, include=args.include
         )
 
-    # Sicherstellen, dass # Titel + Quelle vorhanden sind (falls Modell weglässt)
     if "# " not in md:
         md = f"# {title}\n- Quelle: {url}\n\n" + md.strip() + "\n"
 
     outfile.write_text(md, encoding="utf-8")
-    print(f"[OK] Geschrieben: {outfile}")
+    print(f"[OK] Geschrieben: {outfile}\n[INFO] Genutztes Modell: {model}")
 
 if __name__ == "__main__":
     main()
+
 
 
